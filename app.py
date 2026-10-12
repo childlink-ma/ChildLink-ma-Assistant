@@ -41,7 +41,7 @@ SYSTEM_PROMPT = (
     "When you use the fallback, prefix the answer with [FALLBACK].\n"
     "- Never diagnose. Encourage consulting qualified professionals. Provide red flags and orientation steps when appropriate.\n"
     "- Max 150 words for the main answer.\n"
-    "- Cite sources inline at the end as: References: [Org, Year]; [Org2, Year2]. Do NOT use numeric citations like [1], [2].\n"
+    "- Cite sources inline at the end as: References: [Org, Year]; [Org2, Year2]. Use ONLY the [Org, Year] labels shown in the Context, copied exactly; never invent a reference. Do NOT use numeric citations like [1], [2].\n"
     "- Respond in the user's language.\n"
     "- Do NOT include any disclaimer text in your answer; the UI displays it separately.\n"
 )
@@ -165,12 +165,38 @@ def is_gpt_fallback(contexts, answer: str) -> bool:
     total_ctx = sum(len((c.get("text") or "")) for c in contexts)
     return total_ctx < 40
 
+# ========= Sources: PDF filename -> label =========
+PDF_TO_ORG = {
+    "sign145":                                          ("SIGN 145", "2016"),
+    "autism-spectrum-disorder-in-under-19s-recognition": ("NICE CG128", "2017"),
+    "autism-spectrum-disorder-in-under-19s-support":    ("NICE CG170", "2021"),
+    "trouble_du_spectre_de_lautisme":                   ("HAS", "2018"),
+    "synthese_autisme_ted":                             ("HAS/ANESM", "2012"),
+    "KCE_233":                                          ("KCE 233", "2014"),
+    "peds_20193447":                                    ("AAP ASD", "2020"),
+    "s00787-020-01587-4":                               ("ECAP", "2021"),
+    "Supporting_Students_on_the_Autism_Spectrum":       ("Carrington et al. (QUT)", "2021"),
+    "PIIS089085672030280X":                             ("AACAP", "2020"),
+    "pnds_trisomie_21":                                 ("HAS PNDS T21", "2020"),
+    "peds_2022057010":                                  ("AAP DS", "2022"),
+    "s12888-018-1800-1":                                ("BMC Psychiatry", "2018"),
+}
+
+def resolve_org(raw_org: str, raw_year: str):
+    """Map the PDF filename stored in the metadata to a readable label and year."""
+    if not raw_org:
+        return "", raw_year
+    for key, (org, year) in PDF_TO_ORG.items():
+        if key.lower() in raw_org.lower():
+            return org, year
+    clean = raw_org.replace(".pdf", "").replace("-3", "").replace("_", " ").strip()
+    return clean, raw_year
+
 def build_citations(contexts, max_items=5):
     """Dédoublonne et supprime NC. Conserve year uniquement si renseignée."""
     clean, seen = [], set()
     for c in contexts:
-        src = (c.get("source") or c.get("org") or "").strip()
-        yr  = (c.get("year") or "").strip()
+        src, yr = resolve_org((c.get("source") or c.get("org") or "").strip(), (c.get("year") or "").strip())
         if not src or src == "NC":
             continue
         key = (src, yr if yr and yr != "NC" else "")
@@ -192,8 +218,7 @@ def format_context_block(contexts, limit=6):
         text = (c.get("text") or "").strip()
         if not text:
             continue
-        src = (c.get("source") or c.get("org") or "").strip()
-        yr  = (c.get("year") or "").strip()
+        src, yr = resolve_org((c.get("source") or c.get("org") or "").strip(), (c.get("year") or "").strip())
         if src and yr and yr != "NC":
             head = f"[{src}, {yr}]"
         elif src:
@@ -275,7 +300,8 @@ def ask():
             "en croisant les extraits pertinents ci-dessous. "
             "Ne liste pas les sources au fil du texte; synthétise d’abord, "
             "puis termine par une ligne de références au format: "
-            "References: [Org, Year]; [Org2, Year2].\n\n"
+            "References: [Org, Year]; [Org2, Year2]. "
+            "Utilise UNIQUEMENT les étiquettes [Org, Year] des extraits utilisés, à l'identique; n'invente aucune référence.\n\n"
             f"Context:\n{context_block}\n\nQuestion: {question}"
         )
         messages.append({"role": "user", "content": user_msg})
@@ -294,13 +320,20 @@ def ask():
         answer = re.sub(r'(Ce contenu est fourni.*?dispositif médical\.)', '', answer, flags=re.I|re.S)
         answer = re.sub(r'\n{3,}', '\n\n', answer).strip()
 
-        # Si pas de ligne "References:" en fin de texte, on l'ajoute
-        if "References:" not in answer:
-            refs_txt = "; ".join(
-                [f"[{c['source']}" + (f", {c['year']}]" if 'year' in c else "]") for c in citations]
-            )
-            if refs_txt:
-                answer = f"{answer}\n\nReferences: {refs_txt}"
+        # References: keep only labels that come from the retrieved chunks
+        labels = [f"[{c['source']}" + (f", {c['year']}]" if "year" in c else "]") for c in citations]
+        norm   = lambda s: re.sub(r"\s+", "", s).lower()
+        known  = {norm(l): l for l in labels}
+        parts  = re.split(r"\n?\s*\b(?:R[ée]f[ée]rences|Referencias|Ссылки|Источники|参考文献|参考资料|المراجع)\s*[:：]", answer, flags=re.IGNORECASE)
+        cited  = []
+        if len(parts) > 1:
+            answer = "".join(parts[:-1]).rstrip()
+            for lab in re.findall(r"\[[^\]]+\]", parts[-1]):
+                if norm(lab) in known and known[norm(lab)] not in cited:
+                    cited.append(known[norm(lab)])
+        refs_txt = "; ".join(cited or labels)
+        if refs_txt:
+            answer = f"{answer}\n\nReferences: {refs_txt}"
 
         # Metrics & webhook
         latency_ms = int((time.time() - t0) * 1000)

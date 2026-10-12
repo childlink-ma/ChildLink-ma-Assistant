@@ -48,7 +48,7 @@ def semantic_search(client, query: str, index, metadata, top_k=6, embedding_depl
             continue
         m = metadata[str(idx)] if isinstance(metadata, dict) and str(idx) in metadata else metadata[idx]
         text = (m.get("text") or "")[:1200]
-        contexts.append({"text": text})
+        contexts.append({"text": text, "org": m.get("org", "")})
         citations.append(_norm_source(m))
     return contexts, citations
 
